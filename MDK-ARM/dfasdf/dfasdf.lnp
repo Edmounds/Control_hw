@@ -1,0 +1,28 @@
+--cpu Cortex-M3
+"dfasdf\startup_stm32f103xb.o"
+"dfasdf\main.o"
+"dfasdf\gpio.o"
+"dfasdf\adc.o"
+"dfasdf\tim.o"
+"dfasdf\stm32f1xx_it.o"
+"dfasdf\stm32f1xx_hal_msp.o"
+"dfasdf\stm32f1xx_hal_gpio_ex.o"
+"dfasdf\stm32f1xx_hal_adc.o"
+"dfasdf\stm32f1xx_hal_adc_ex.o"
+"dfasdf\stm32f1xx_hal.o"
+"dfasdf\stm32f1xx_hal_rcc.o"
+"dfasdf\stm32f1xx_hal_rcc_ex.o"
+"dfasdf\stm32f1xx_hal_gpio.o"
+"dfasdf\stm32f1xx_hal_dma.o"
+"dfasdf\stm32f1xx_hal_cortex.o"
+"dfasdf\stm32f1xx_hal_pwr.o"
+"dfasdf\stm32f1xx_hal_flash.o"
+"dfasdf\stm32f1xx_hal_flash_ex.o"
+"dfasdf\stm32f1xx_hal_exti.o"
+"dfasdf\stm32f1xx_hal_tim.o"
+"dfasdf\stm32f1xx_hal_tim_ex.o"
+"dfasdf\system_stm32f1xx.o"
+--strict --scatter "dfasdf\dfasdf.sct"
+--summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols
+--info sizes --info totals --info unused --info veneers
+--list "dfasdf.map" -o dfasdf\dfasdf.axf
