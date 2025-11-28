@@ -22,6 +22,7 @@
 #include "tim.h"
 #include "gpio.h"
 
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
@@ -29,7 +30,10 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum {
+  STATE_DARK,
+  STATE_BRIGHT
+} LightState;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -51,6 +55,13 @@ float voltage_feedback = 0;      // 电压反馈值
 uint16_t pwm_duty = 0;           // PWM占空比
 volatile uint16_t adc_value = 0; // ADC转换结果 (由ADC中断更新)
 volatile uint8_t adc_ready = 0;  // ADC数据就绪标志
+LightState light_state = STATE_DARK;
+float adc2_value = 0.0f;
+
+// 渐变调光相关变量
+float target_pwm_duty = 800.0f;  // 目标PWM占空比
+float current_pwm_duty = 800.0f; // 当前PWM占空比
+float pwm_step = 1.0f;           // 渐变步长 (每0.5ms调整量)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -95,6 +106,7 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM1_Init();
   MX_ADC1_Init();
+  MX_ADC2_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
@@ -116,6 +128,27 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // 1. 读取ADC2 (感光模块)
+    HAL_ADC_Start(&hadc2);
+    if (HAL_ADC_PollForConversion(&hadc2, 100) == HAL_OK)
+    {
+      // 转换为电压值 (0-3.3V)
+      adc2_value = (float)HAL_ADC_GetValue(&hadc2) * 3.3f / 4096.0f;
+    }
+    HAL_ADC_Stop(&hadc2);
+
+    // 2. 根据光照强度计算目标PWM (线性映射)
+    // 假设: ADC < 0.2V (强光) -> PWM = 400 (约12V, 低亮)
+    // 假设: ADC > 3.0V (弱光) -> PWM = 2200 (高亮)
+    float adc_clamped = adc2_value;
+    if (adc_clamped < 0.2f) adc_clamped = 0.2f;
+    if (adc_clamped > 3.0f) adc_clamped = 3.0f;
+    
+    // 线性插值: PWM = Min + (Max-Min) * (Val - MinVal) / (MaxVal - MinVal)
+    // Slope = (2800 - 800) / (3.0 - 0.2) = 2000 / 2.8 ≈ 714.3
+    target_pwm_duty = 800.0f + (adc_clamped - 0.2f) * 714.3f;
+
+    HAL_Delay(50); // 控制循环频率
 
     /* USER CODE END WHILE */
 
@@ -253,7 +286,7 @@ float ADC_ReadVoltage_HAL(void)
 {
   // 直接读取ADC中断更新的值,无需等待
   float voltage = (float)adc_value * 3.3f / 4096.0f;
-  return voltage * 5.97f; // 乘以分压比
+  return voltage * 5.965f; // 乘以分压比
 }
 
 /**
@@ -266,11 +299,20 @@ void Control_Loop_HAL(void)
   // 1. 读取上次ADC转换的电压值 (已经准备好,无需等待)
   voltage_feedback = ADC_ReadVoltage_HAL();
 
-  // 2. PI控制计算
-  float pi_output = PI_Update(&voltage_pi, voltage_setpoint, voltage_feedback);
+  // 2. PWM渐变控制 (Soft Start / Gradient)
+  if (current_pwm_duty < target_pwm_duty)
+  {
+    current_pwm_duty += pwm_step;
+    if (current_pwm_duty > target_pwm_duty) current_pwm_duty = target_pwm_duty;
+  }
+  else if (current_pwm_duty > target_pwm_duty)
+  {
+    current_pwm_duty -= pwm_step;
+    if (current_pwm_duty < target_pwm_duty) current_pwm_duty = target_pwm_duty;
+  }
 
   // 3. 更新PWM占空比
-  pwm_duty = (uint16_t)pi_output;
+  pwm_duty = (uint16_t)current_pwm_duty;
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_duty);
 
   // 4. 启动下次ADC转换 (中断方式,非阻塞)
