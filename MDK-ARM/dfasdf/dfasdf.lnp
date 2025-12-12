@@ -1,6 +1,7 @@
 --cpu Cortex-M3
 "dfasdf\startup_stm32f103xb.o"
 "dfasdf\main.o"
+"dfasdf\oled.o"
 "dfasdf\gpio.o"
 "dfasdf\adc.o"
 "dfasdf\tim.o"

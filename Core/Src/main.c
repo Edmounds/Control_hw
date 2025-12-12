@@ -26,6 +26,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
+#include <stdio.h>
+#include "oled.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,11 +59,6 @@ volatile uint16_t adc_value = 0; // ADC转换结果 (由ADC中断更新)
 volatile uint8_t adc_ready = 0;  // ADC数据就绪标志
 LightState light_state = STATE_DARK;
 float adc2_value = 0.0f;
-
-// 渐变调光相关变量
-float target_pwm_duty = 800.0f;  // 目标PWM占空比
-float current_pwm_duty = 800.0f; // 当前PWM占空比
-float pwm_step = 1.0f;           // 渐变步长 (每0.5ms调整量)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -110,6 +107,12 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
+  OLED_Init();
+  OLED_Clear();
+  OLED_ShowString(0, 0, "OLED OK", 16);
+  OLED_ShowString(0, 2, "PB9 SCL", 16);
+  OLED_ShowString(0, 4, "PB8 SDA", 16);
+
   // 初始化PI控制器
   PI_Init(&voltage_pi, 40,600 , 2880, 0);
 
@@ -128,27 +131,22 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // 1. 读取ADC2 (感光模块)
-    HAL_ADC_Start(&hadc2);
-    if (HAL_ADC_PollForConversion(&hadc2, 100) == HAL_OK)
-    {
-      // 转换为电压值 (0-3.3V)
-      adc2_value = (float)HAL_ADC_GetValue(&hadc2) * 3.3f / 4096.0f;
-    }
-    HAL_ADC_Stop(&hadc2);
+    char buf[16];
 
-    // 2. 根据光照强度计算目标PWM (线性映射)
-    // 假设: ADC < 0.2V (强光) -> PWM = 400 (约12V, 低亮)
-    // 假设: ADC > 3.0V (弱光) -> PWM = 2200 (高亮)
-    float adc_clamped = adc2_value;
-    if (adc_clamped < 0.2f) adc_clamped = 0.2f;
-    if (adc_clamped > 3.0f) adc_clamped = 3.0f;
-    
-    // 线性插值: PWM = Min + (Max-Min) * (Val - MinVal) / (MaxVal - MinVal)
-    // Slope = (2800 - 800) / (3.0 - 0.2) = 2000 / 2.8 ≈ 714.3
-    target_pwm_duty = 800.0f + (adc_clamped - 0.2f) * 714.3f;
+    // // 光照采样
+    // HAL_ADC_Start(&hadc2);
+    // if (HAL_ADC_PollForConversion(&hadc2, 100) == HAL_OK)
+    // {
+    //   adc2_value = (float)HAL_ADC_GetValue(&hadc2) * 3.3f / 4096.0f;
+    // }
+    // HAL_ADC_Stop(&hadc2);
 
-    HAL_Delay(50); // 控制循环频率
+    // OLED 中央显示ADC1采样电压（稳压反馈）
+    (void)snprintf(buf, sizeof(buf), "V=%.2fV", voltage_feedback);
+    OLED_ShowString(32, 3, "        ", 16); // 清行
+    OLED_ShowString(32, 3, buf, 16);
+
+    HAL_Delay(50); // 主循环节拍
 
     /* USER CODE END WHILE */
 
@@ -168,7 +166,7 @@ void SystemClock_Config(void)
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
+   * in the RCC_Os0cInitTypeDef structure.
    */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
@@ -279,7 +277,6 @@ float PI_Update(PI_Controller *pi, float setpoint, float feedback)
 
  * @brief  读取ADC电压值 (从缓存读取,非阻塞)
  * @note   读取ADC中断已更新的转换结果
- *         假设使用6:1分压比
  * @retval 实际电压值(V)
  */
 float ADC_ReadVoltage_HAL(void)
@@ -299,20 +296,11 @@ void Control_Loop_HAL(void)
   // 1. 读取上次ADC转换的电压值 (已经准备好,无需等待)
   voltage_feedback = ADC_ReadVoltage_HAL();
 
-  // 2. PWM渐变控制 (Soft Start / Gradient)
-  if (current_pwm_duty < target_pwm_duty)
-  {
-    current_pwm_duty += pwm_step;
-    if (current_pwm_duty > target_pwm_duty) current_pwm_duty = target_pwm_duty;
-  }
-  else if (current_pwm_duty > target_pwm_duty)
-  {
-    current_pwm_duty -= pwm_step;
-    if (current_pwm_duty < target_pwm_duty) current_pwm_duty = target_pwm_duty;
-  }
+  // 2. PI调节到设定12V
+  float control = PI_Update(&voltage_pi, voltage_setpoint, voltage_feedback);
 
   // 3. 更新PWM占空比
-  pwm_duty = (uint16_t)current_pwm_duty;
+  pwm_duty = (uint16_t)control;
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_duty);
 
   // 4. 启动下次ADC转换 (中断方式,非阻塞)
@@ -334,7 +322,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     // 执行控制循环 (只读取、计算、输出,不阻塞)
     Control_Loop_HAL();
 
-    // (可选)LED翻转用于调试
     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
   }
 }
