@@ -167,7 +167,7 @@ void SystemClock_Config(void)
 
   /** Initializes the RCC Oscillators according to the specified parameters
    * in the RCC_Os0cInitTypeDef structure.
-   */
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
