@@ -22,11 +22,11 @@
 #include "tim.h"
 #include "gpio.h"
 
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include "oled.h"
 /* USER CODE END Includes */
 
@@ -40,7 +40,8 @@ typedef enum {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define MAX_VOLTAGE 20.0f // 系统最大测量电压 (3.3V * 5.965)
+#define PWM_PERIOD 2880   // PWM周期计数值
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -59,6 +60,12 @@ volatile uint16_t adc_value = 0; // ADC转换结果 (由ADC中断更新)
 volatile uint8_t adc_ready = 0;  // ADC数据就绪标志
 LightState light_state = STATE_DARK;
 float adc2_value = 0.0f;
+
+// RMS Calculation Variables
+volatile float adc_rms_voltage = 0.0f;
+uint64_t adc_sq_sum = 0;
+uint16_t adc_sample_cnt = 0;
+#define RMS_SAMPLE_COUNT 100
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -73,9 +80,9 @@ void SystemClock_Config(void);
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
 
@@ -103,18 +110,14 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM1_Init();
   MX_ADC1_Init();
-  MX_ADC2_Init();
   MX_TIM2_Init();
+  MX_ADC2_Init();
   /* USER CODE BEGIN 2 */
 
   OLED_Init();
-  OLED_Clear();
-  OLED_ShowString(0, 0, "OLED OK", 16);
-  OLED_ShowString(0, 2, "PB9 SCL", 16);
-  OLED_ShowString(0, 4, "PB8 SDA", 16);
-
   // 初始化PI控制器
-  PI_Init(&voltage_pi, 40,600 , 2880, 0);
+  // 对应参数: Kp=1.0, Ki=10.0, 输出限幅[0.0, 1.0]
+  PI_Init(&voltage_pi, 1.0f, 12.0f, 1.0f, 0.0f);
 
   // 启动PWM (TIM1)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -126,14 +129,12 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
-
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     char buf[16];
-
-    // // 光照采样
+    char buf2[16];
     // HAL_ADC_Start(&hadc2);
     // if (HAL_ADC_PollForConversion(&hadc2, 100) == HAL_OK)
     // {
@@ -142,23 +143,23 @@ int main(void)
     // HAL_ADC_Stop(&hadc2);
 
     // OLED 中央显示ADC1采样电压（稳压反馈）
-    (void)snprintf(buf, sizeof(buf), "V=%.2fV", voltage_feedback);
-    OLED_ShowString(32, 3, "        ", 16); // 清行
-    OLED_ShowString(32, 3, buf, 16);
+    // (void)snprintf(buf, sizeof(buf), "V=%-5.2fV", voltage_feedback);
+    (void)snprintf(buf, sizeof(buf), "V=%-5.2fV", adc_rms_voltage);
+    OLED_ShowString(32, 1, buf, 16);
+    // OLED_ShowString(32, 3, buf, 16);
 
-    HAL_Delay(50); // 主循环节拍
+    HAL_Delay(50); 
 
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
+  * @brief System Clock Configuration
+  * @retval None
+  */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -166,7 +167,7 @@ void SystemClock_Config(void)
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_Os0cInitTypeDef structure.
+  * in the RCC_OscInitTypeDef structure.
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
@@ -181,8 +182,9 @@ void SystemClock_Config(void)
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
@@ -255,8 +257,6 @@ float PI_Update(PI_Controller *pi, float setpoint, float feedback)
     output_clamped = pi->output_min;
   }
 
-  // 4. 积分抗饱和 (Anti-Windup Clamping)
-  // 核心：只有当输出没有被"卡死"在上限或下限时，才允许积分
   //
   // 解释：
   // (error > 0 && output < pi->output_max) -> 误差为正，且输出没到顶，允许正向累积
@@ -293,17 +293,21 @@ float ADC_ReadVoltage_HAL(void)
  */
 void Control_Loop_HAL(void)
 {
-  // 1. 读取上次ADC转换的电压值 (已经准备好,无需等待)
+  // 1. 读取上次ADC转换的电压值 
   voltage_feedback = ADC_ReadVoltage_HAL();
 
-  // 2. PI调节到设定12V
-  float control = PI_Update(&voltage_pi, voltage_setpoint, voltage_feedback);
+  // 2. 归一化处理 (0.0 ~ 1.0)
+  float feedback_norm = voltage_feedback / MAX_VOLTAGE;
+  float setpoint_norm = voltage_setpoint / MAX_VOLTAGE;
 
-  // 3. 更新PWM占空比
-  pwm_duty = (uint16_t)control;
+  // 3. PI调节 (输入输出都是 0.0~1.0)
+  float control_norm = PI_Update(&voltage_pi, setpoint_norm, feedback_norm);
+
+  // 4. 映射回PWM占空比
+  pwm_duty = (uint16_t)(control_norm * PWM_PERIOD);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_duty);
 
-  // 4. 启动下次ADC转换 (中断方式,非阻塞)
+  // 5. 启动下次ADC转换 (中断方式,非阻塞)
   HAL_ADC_Start_IT(&hadc1);
 }
 
@@ -340,15 +344,28 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     // 读取ADC转换结果并保存
     adc_value = HAL_ADC_GetValue(&hadc1);
     adc_ready = 1; // 标记数据已就绪
+
+    // 计算有效值 (RMS)
+    adc_sq_sum += (uint64_t)adc_value * adc_value;
+    adc_sample_cnt++;
+    if (adc_sample_cnt >= RMS_SAMPLE_COUNT)
+    {
+      float mean_sq = (float)adc_sq_sum / adc_sample_cnt;
+      float rms_adc = sqrtf(mean_sq);
+      // 转换为电压值: (RMS_ADC / 4096) * 3.3 * 5.965
+      adc_rms_voltage = (rms_adc * 3.3f / 4096.0f) * 5.965f;
+      
+      adc_sq_sum = 0;
+      adc_sample_cnt = 0;
+    }
   }
 }
 
 /* USER CODE END 4 */
-
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
@@ -361,12 +378,12 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */

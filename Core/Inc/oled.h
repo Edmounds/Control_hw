@@ -9,9 +9,9 @@ typedef uint8_t u8;
 typedef uint32_t u32;
 
 #define OLED_SCL_PORT GPIOB
-#define OLED_SCL_PIN  GPIO_PIN_9
+#define OLED_SCL_PIN  GPIO_PIN_8
 #define OLED_SDA_PORT GPIOB
-#define OLED_SDA_PIN  GPIO_PIN_8
+#define OLED_SDA_PIN  GPIO_PIN_9
 
 #define OLED_SCLK_Set()                                                   \
   HAL_GPIO_WritePin(OLED_SCL_PORT, OLED_SCL_PIN, GPIO_PIN_SET)

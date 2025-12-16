@@ -25,7 +25,7 @@ static void OLED_GPIO_Config(void)
 
   GPIO_InitTypeDef gpio_init = {0};
   gpio_init.Pin = OLED_SCL_PIN | OLED_SDA_PIN;
-  gpio_init.Mode = GPIO_MODE_OUTPUT_OD;
+  gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
   gpio_init.Pull = GPIO_NOPULL;
   gpio_init.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(OLED_SCL_PORT, &gpio_init);
@@ -36,7 +36,7 @@ static void OLED_GPIO_Config(void)
 
 static void OledDelay(void)
 {
-  for (volatile uint16_t i = 0; i < 50; i++) {
+  for (volatile uint16_t i = 0; i < 5; i++) {
     __NOP();
   }
 }
@@ -246,7 +246,7 @@ void OLED_DrawBMP(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1,
 void OLED_Init(void)
 {
   OLED_GPIO_Config();
-  HAL_Delay(100);
+  HAL_Delay(50);
 
   OLED_WR_Byte(0xAE, OLED_CMD);
   OLED_WR_Byte(0x00, OLED_CMD);

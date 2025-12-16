@@ -33,4 +33,5 @@ dfasdf\main.o: ../Core/Inc/adc.h
 dfasdf\main.o: ../Core/Inc/tim.h
 dfasdf\main.o: ../Core/Inc/gpio.h
 dfasdf\main.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
+dfasdf\main.o: D:\Keil_v5\ARM\ARMCC\Bin\..\include\math.h
 dfasdf\main.o: ../Core/Inc/oled.h
