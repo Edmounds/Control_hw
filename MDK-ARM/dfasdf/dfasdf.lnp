@@ -4,6 +4,7 @@
 "dfasdf\main.o"
 "dfasdf\gpio.o"
 "dfasdf\adc.o"
+"dfasdf\dma.o"
 "dfasdf\tim.o"
 "dfasdf\stm32f1xx_it.o"
 "dfasdf\stm32f1xx_hal_msp.o"

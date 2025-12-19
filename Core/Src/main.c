@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "adc.h"
+#include "dma.h"
 #include "tim.h"
 #include "gpio.h"
 
@@ -44,27 +45,38 @@ typedef enum {
 #define PWM_PERIOD 2880   // PWM周期计数值
 
 // 硬件参数定义 (NTC)
-#define R_UP          24000.0f  // 上拉电阻 R72 = 3K
+#define R_UP          3000.0f   // 上拉电阻 R72 = 3K
 #define R_PARALLEL    5000.0f  // 并联电阻 R73 = 5K
-#define V_CC          5.0f     // 供电电压 5V
+#define V_CC          3.3f     // 供电电压 3.3V
 #define B_VALUE       3950.0f  // NTC的B值 
-#define R_NTC_25      10000.0f // 25度时的NTC阻值 (通常是10K)
+#define R_NTC_25      20000.0f // 
 #define T25           298.15f  // 25度对应的开尔文温度
 
-#define FILTER_SIZE 10 // 滑动平均滤波窗口大小
+// 1. 采样电阻 (R66)
+#define CURRENT_SENSE_RES  0.005f  // 5毫欧
+
+// 2. 运放放大倍数 (51k / 1k)
+#define CURRENT_AMP_GAIN   51.0f   // 放大51倍
+
+// 定义两个不同的窗口大小
+#define FILTER_SIZE_FAST 10   // 给电流用 (5ms响应)
+#define FILTER_SIZE_SLOW 80   // 给温度/电池用 (32ms响应，能盖过50Hz周期)
+#define MAX_FILTER_SIZE  128   // 最大的那个，用于定义数组
 
 typedef struct {
-  uint16_t buffer[FILTER_SIZE];
+  uint16_t buffer[MAX_FILTER_SIZE]; // 数组开到最大
   uint8_t index;
   uint32_t sum;
   uint8_t count;
+  uint8_t size; // 新增：每个滤波器自己的大小
 } Filter_t;
 
 typedef struct {
-  float buffer[FILTER_SIZE];
+  float buffer[MAX_FILTER_SIZE];
   uint8_t index;
   float sum;
   uint8_t count;
+  uint8_t size; // 新增
 } Filter_Float_t;
 /* USER CODE END PD */
 
@@ -91,15 +103,18 @@ uint64_t adc_sq_sum = 0;
 uint16_t adc_sample_cnt = 0;
 #define RMS_SAMPLE_COUNT 100
 
-// ADC State Machine
-typedef enum {
-  ADC_STATE_FEEDBACK = 0, // PA2
-  ADC_STATE_TEMP,         // PA5
-  ADC_STATE_BAT,          // PA6
-  ADC_STATE_CURRENT       // PA7
-} AdcState;
+// RMS Calculation Buffers (Main Loop)
+volatile uint64_t adc_sq_sum_buf = 0;
+volatile float vac_sq_sum_buf = 0.0f;
+volatile uint8_t rms_ready_flag = 0; // Bit 0: ADC1, Bit 1: ADC2
 
-volatile AdcState adc1_state = ADC_STATE_FEEDBACK;
+// ADC DMA Buffer
+volatile uint16_t adc_dma_buffer[4];
+// buffer[0]: Feedback (PA2)
+// buffer[1]: Temp (PA5)
+// buffer[2]: Bat (PA6)
+// buffer[3]: Current (PA7)
+
 volatile uint16_t adc_vac_raw = 0;     // ADC2 PA4
 volatile uint16_t adc_temp_raw = 0;    // ADC1 PA5
 volatile uint16_t adc_bat_raw = 0;     // ADC1 PA6
@@ -129,9 +144,26 @@ void SystemClock_Config(void);
 float Get_Temperature(uint16_t adc_val);
 uint16_t Apply_Filter(Filter_t *f, uint16_t val);
 float Apply_Filter_Float(Filter_Float_t *f, float val);
+void Control_Loop_HAL(void); // Add prototype
+void Filter_Init(Filter_t *f, uint8_t size);
+void Filter_Float_Init(Filter_Float_t *f, uint8_t size);
 /* USER CODE END PFP */
 
-/* Private user code ---------------------------------------------------------*/
+void Filter_Init(Filter_t *f, uint8_t size) {
+    f->size = (size > MAX_FILTER_SIZE) ? MAX_FILTER_SIZE : size;
+    f->index = 0;
+    f->sum = 0;
+    f->count = 0;
+    for(int i=0; i<MAX_FILTER_SIZE; i++) f->buffer[i] = 0;
+}
+
+void Filter_Float_Init(Filter_Float_t *f, uint8_t size) {
+    f->size = (size > MAX_FILTER_SIZE) ? MAX_FILTER_SIZE : size;
+    f->index = 0;
+    f->sum = 0.0f;
+    f->count = 0;
+    for(int i=0; i<MAX_FILTER_SIZE; i++) f->buffer[i] = 0.0f;
+}/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /* USER CODE END 0 */
@@ -165,6 +197,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM1_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
@@ -186,6 +219,20 @@ int main(void)
   // 校准ADC (提高精度)
   HAL_ADCEx_Calibration_Start(&hadc1);
 
+  // 启动 ADC1 DMA (循环模式, 自动搬运4个通道数据)
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_dma_buffer, 4);
+
+  // --- 初始化滤波器 ---
+  // 温度和电池：用慢速 (64个点 = 32ms窗口)，为了稳！
+  Filter_Init(&flt_temp, FILTER_SIZE_SLOW);
+  Filter_Init(&flt_bat, FILTER_SIZE_SLOW);
+  
+  // 电流
+  Filter_Init(&flt_current, FILTER_SIZE_SLOW);
+  
+  // 市电RMS：它本身更新就慢，稍微平滑一下即可 (比如4)
+  Filter_Float_Init(&flt_vac, 2); 
+
   // 启动控制循环定时器 (TIM2)
   HAL_TIM_Base_Start_IT(&htim2);
 
@@ -195,6 +242,24 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    // --- RMS 计算处理 (移出中断) ---
+    if (rms_ready_flag & 0x01) // ADC1 Feedback
+    {
+      float mean_sq = (float)adc_sq_sum_buf / RMS_SAMPLE_COUNT;
+      float rms_adc = sqrtf(mean_sq);
+      adc_rms_voltage = (rms_adc * 3.3f / 4096.0f) * 5.965f;
+      rms_ready_flag &= ~0x01;
+    }
+
+    if (rms_ready_flag & 0x02) // ADC2 VAC
+    {
+      float mean_sq = vac_sq_sum_buf / RMS_SAMPLE_COUNT;
+      vac_rms_voltage = sqrtf(mean_sq);
+      vac_rms_flt = Apply_Filter_Float(&flt_vac, vac_rms_voltage);
+      rms_ready_flag &= ~0x02;
+    }
+    // -----------------------------
+
     char buf[20];
 
     // 1. 稳压反馈
@@ -207,14 +272,18 @@ int main(void)
     OLED_ShowString(0, 2, buf, 12);
 
     // 3. 温度 & 电池 
-    float temp_val = Get_Temperature(adc_temp_flt);
+    float temp_val = Get_Temperature(adc_temp_flt) - 85.0f;
     float bat_val = ((float)adc_bat_flt * 3.3f / 4096.0f) * 12.0f;
     (void)snprintf(buf, sizeof(buf), "T:%-3.1f B:%-3.1f", temp_val, bat_val);
     OLED_ShowString(0, 4, buf, 12);
 
     // 4. 母线电流 
-    float current_val = (float)adc_current_flt * 3.3f / 4096.0f;
-    (void)snprintf(buf, sizeof(buf), "I:%-4.2fA", current_val);
+    float v_pin = (float)adc_current_flt * 3.3f / 4096.0f;
+    float current_actual = v_pin / (CURRENT_SENSE_RES * CURRENT_AMP_GAIN);
+
+    if (current_actual < 0.1f) current_actual = 0.0f; // 强制归零小电流噪音
+
+    (void)snprintf(buf, sizeof(buf), "I:%-4.2fA", current_actual/11.0f);
     OLED_ShowString(0, 6, buf, 12);
 
     HAL_Delay(50); // 刷新率 20Hz
@@ -343,45 +412,41 @@ float PI_Update(PI_Controller *pi, float setpoint, float feedback)
   return output_clamped;
 }
 
-/**
 
- * @brief  读取ADC电压值 (从缓存读取,非阻塞)
- * @note   读取ADC中断已更新的转换结果
- * @retval 实际电压值(V)
- */
-float ADC_ReadVoltage_HAL(void)
-{
-  // 直接读取ADC中断更新的值,无需等待
-  float voltage = (float)adc_value * 3.3f / 4096.0f;
-  return voltage * 5.965f; // 乘以分压比
-}
-
-/**
- * @brief  配置ADC1通道
- * @param  channel: ADC通道
- * @retval None
- */
-void ADC1_Select_Channel(uint32_t channel)
-{
-  ADC_ChannelConfTypeDef sConfig = {0};
-  sConfig.Channel = channel;
-  sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_13CYCLES_5;
-  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
 
 /**
  * @brief  控制循环
- * @note   读取电压,PI计算,更新PWM占空比,启动下次ADC转换
+ * @note   读取电压,PI计算,更新PWM占空比
  * @retval None
  */
 void Control_Loop_HAL(void)
 {
-  // 1. 读取上次ADC转换的电压值 
-  voltage_feedback = ADC_ReadVoltage_HAL();
+  // 1. 直接从 DMA 数组取值 (Feedback = buffer[0])
+  uint16_t raw_feedback = adc_dma_buffer[0];
+  
+  // 转换电压
+  voltage_feedback = ((float)raw_feedback * 3.3f / 4096.0f) * 5.965f;
+
+  // --- RMS 计算 (Feedback) ---
+  // 移入控制循环，保持与之前类似的统计逻辑
+  adc_sq_sum += (uint64_t)raw_feedback * raw_feedback;
+  adc_sample_cnt++;
+  if (adc_sample_cnt >= RMS_SAMPLE_COUNT)
+  {
+    adc_sq_sum_buf = adc_sq_sum;
+    rms_ready_flag |= 0x01; // 标记ADC1数据就绪
+    
+    adc_sq_sum = 0;
+    adc_sample_cnt = 0;
+  }
+  // ---------------------------
+
+  // --- 更新其他传感器滤波值 ---
+  // Temp (buffer[1]), Bat (buffer[2]), Current (buffer[3])
+  adc_temp_flt = Apply_Filter(&flt_temp, adc_dma_buffer[1]);
+  adc_bat_flt = Apply_Filter(&flt_bat, adc_dma_buffer[2]);
+  adc_current_flt = Apply_Filter(&flt_current, adc_dma_buffer[3]);
+  // ---------------------------
 
   // 2. 归一化处理 (0.0 ~ 1.0)
   float feedback_norm = voltage_feedback / MAX_VOLTAGE;
@@ -394,9 +459,8 @@ void Control_Loop_HAL(void)
   pwm_duty = (uint16_t)(control_norm * PWM_PERIOD);
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_duty);
 
-  // 5. 启动下次ADC转换 (中断方式,非阻塞)
-  HAL_ADC_Start_IT(&hadc2); // VAC (ADC2)
-  HAL_ADC_Start_IT(&hadc1); // Feedback (ADC1) - Start Sequence
+  // 5. 启动 ADC2 (VAC) 转换 (ADC1 由 DMA 自动处理，无需手动启动)
+  HAL_ADC_Start_IT(&hadc2); 
 }
 
 /**
@@ -427,66 +491,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
  */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-  if (hadc->Instance == ADC1)
-  {
-    uint16_t val = HAL_ADC_GetValue(&hadc1);
-    
-    switch (adc1_state)
-    {
-      case ADC_STATE_FEEDBACK:
-        // 读取ADC转换结果并保存
-        adc_value = val;
-        adc_ready = 1; // 标记数据已就绪
-
-        // 计算有效值 (RMS)
-        adc_sq_sum += (uint64_t)adc_value * adc_value;
-        adc_sample_cnt++;
-        if (adc_sample_cnt >= RMS_SAMPLE_COUNT)
-        {
-          float mean_sq = (float)adc_sq_sum / adc_sample_cnt;
-          float rms_adc = sqrtf(mean_sq);
-          // 转换为电压值: (RMS_ADC / 4096) * 3.3 * 5.965
-          adc_rms_voltage = (rms_adc * 3.3f / 4096.0f) * 5.965f;
-          
-          adc_sq_sum = 0;
-          adc_sample_cnt = 0;
-        }
-        
-        // Switch to TEMP
-        adc1_state = ADC_STATE_TEMP;
-        ADC1_Select_Channel(ADC_CHANNEL_5);
-        HAL_ADC_Start_IT(&hadc1);
-        break;
-
-      case ADC_STATE_TEMP:
-        adc_temp_raw = val;
-        adc_temp_flt = Apply_Filter(&flt_temp, val);
-        // Switch to BAT
-        adc1_state = ADC_STATE_BAT;
-        ADC1_Select_Channel(ADC_CHANNEL_6);
-        HAL_ADC_Start_IT(&hadc1);
-        break;
-
-      case ADC_STATE_BAT:
-        adc_bat_raw = val;
-        adc_bat_flt = Apply_Filter(&flt_bat, val);
-        // Switch to CURRENT
-        adc1_state = ADC_STATE_CURRENT;
-        ADC1_Select_Channel(ADC_CHANNEL_7);
-        HAL_ADC_Start_IT(&hadc1);
-        break;
-
-      case ADC_STATE_CURRENT:
-        adc_current_raw = val;
-        adc_current_flt = Apply_Filter(&flt_current, val);
-        // Reset to FEEDBACK for next TIM2 trigger
-        adc1_state = ADC_STATE_FEEDBACK;
-        ADC1_Select_Channel(ADC_CHANNEL_2);
-        // STOP sequence, wait for TIM2
-        break;
-    }
-  }
-  else if (hadc->Instance == ADC2)
+  if (hadc->Instance == ADC2)
   {
     adc_vac_raw = HAL_ADC_GetValue(&hadc2);
 
@@ -502,19 +507,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     if (vac_sample_cnt >= RMS_SAMPLE_COUNT)
     {
       // 4. 计算均方根
-      float mean_sq = vac_sq_sum / vac_sample_cnt;
-      vac_rms_voltage = sqrtf(mean_sq);
-      
-      // 对RMS结果进行滤波
-      vac_rms_flt = Apply_Filter_Float(&flt_vac, vac_rms_voltage);
-
+      vac_sq_sum_buf = vac_sq_sum;
+      rms_ready_flag |= 0x02; // 标记ADC2数据就绪
       // 清零重新累计
       vac_sq_sum = 0.0f;
       vac_sample_cnt = 0;
     }
   }
 }
-
 /**
  * @brief  滑动平均滤波 (uint16_t)
  */
@@ -525,12 +525,12 @@ uint16_t Apply_Filter(Filter_t *f, uint16_t val)
   f->sum += val;
   
   f->index++;
-  if (f->index >= FILTER_SIZE)
+  if (f->index >= f->size)
   {
     f->index = 0;
   }
 
-  if (f->count < FILTER_SIZE)
+  if (f->count < f->size)
   {
     f->count++;
   }
@@ -548,12 +548,12 @@ float Apply_Filter_Float(Filter_Float_t *f, float val)
   f->sum += val;
   
   f->index++;
-  if (f->index >= FILTER_SIZE)
+  if (f->index >= f->size)
   {
     f->index = 0;
   }
 
-  if (f->count < FILTER_SIZE)
+  if (f->count < f->size)
   {
     f->count++;
   }
@@ -561,39 +561,44 @@ float Apply_Filter_Float(Filter_Float_t *f, float val)
   return f->sum / f->count;
 }
 
-/**
- * @brief  计算NTC温度
- * @param  adc_val: ADC原始值
- * @retval 温度(摄氏度)
- */
+// 20K B3950 Steinhart-Hart 系数
+#define SH_A 0.001016186f
+#define SH_B 0.000224868f
+#define SH_C 0.0000001156f 
+
 float Get_Temperature(uint16_t adc_val)
 {
-    // 1. 先算出引脚的电压 (0-3.3V)
+    // 1. 算出引脚电压
     float v_pin = (float)adc_val * 3.3f / 4096.0f;
-
-    // 防止除以0的保护
+    
+    // 保护：防止除以0或电压异常
     if(v_pin >= V_CC || v_pin <= 0.1f) return 0.0f;
 
-    // 2. 反推下半部分的电阻值 (分压公式逆运算)
-    // V_pin = V_cc * (R_down / (R_up + R_down))
-    // 推导得: R_down = (V_pin * R_up) / (V_cc - V_pin)
+    // 2. 反推 NTC 电阻值 (保持你原有的电路逻辑)
+    // R_down = (V_pin * R_UP) / (V_cc - V_pin)
     float r_down = (v_pin * R_UP) / (V_CC - v_pin);
 
-    // 3. 算出NTC的实际阻值 (因为有个 R73 5K 跟它并联，要剥离出来)
-    // 1/R_down = 1/R_ntc + 1/R_parallel
-    // 推导得: R_ntc = 1 / ( (1/r_down) - (1/R_parallel) )
+    // 剥离并联电阻 R_PARALLEL (如果你板子上还有 R73 5K 的话)
+    // 如果没有 R73，直接用 r_ntc = r_down
     float r_ntc = 1.0f / ( (1.0f / r_down) - (1.0f / R_PARALLEL) );
 
-    // 如果计算出负值或无穷大，说明没接传感器
-    if (r_ntc <= 0) return 0.0f; 
+    // 再次检查负值（防止并联电阻计算溢出）
+    if (r_ntc <= 0.0f) return 0.0f; 
 
-    // 4. 使用 Steinhart-Hart (Beta) 公式转为温度
-    float log_r = log(r_ntc / R_NTC_25);
-    float temp_kelvin = 1.0f / ( (1.0f / T25) + (log_r / B_VALUE) );
-    float temp_celsius = temp_kelvin - 273.15f; // 转为摄氏度
+    // 3. 使用拟合好的 Steinhart-Hart 公式计算温度
+    float log_r = logf(r_ntc); // 取自然对数
+    float log_r3 = log_r * log_r * log_r; // 对数的立方
+
+    // Steinhart-Hart 公式: 1/T = A + B*ln(R) + C*(ln(R))^3
+    float temp_kelvin = 1.0f / (SH_A + SH_B * log_r + SH_C * log_r3);
+    
+    // 转摄氏度
+    float temp_celsius = temp_kelvin - 273.15f;
 
     return temp_celsius;
 }
+
+
 
 /* USER CODE END 4 */
 
