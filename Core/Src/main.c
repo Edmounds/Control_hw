@@ -42,6 +42,30 @@ typedef enum {
 /* USER CODE BEGIN PD */
 #define MAX_VOLTAGE 20.0f // 系统最大测量电压 (3.3V * 5.965)
 #define PWM_PERIOD 2880   // PWM周期计数值
+
+// 硬件参数定义 (NTC)
+#define R_UP          24000.0f  // 上拉电阻 R72 = 3K
+#define R_PARALLEL    5000.0f  // 并联电阻 R73 = 5K
+#define V_CC          5.0f     // 供电电压 5V
+#define B_VALUE       3950.0f  // NTC的B值 
+#define R_NTC_25      10000.0f // 25度时的NTC阻值 (通常是10K)
+#define T25           298.15f  // 25度对应的开尔文温度
+
+#define FILTER_SIZE 10 // 滑动平均滤波窗口大小
+
+typedef struct {
+  uint16_t buffer[FILTER_SIZE];
+  uint8_t index;
+  uint32_t sum;
+  uint8_t count;
+} Filter_t;
+
+typedef struct {
+  float buffer[FILTER_SIZE];
+  uint8_t index;
+  float sum;
+  uint8_t count;
+} Filter_Float_t;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,12 +90,45 @@ volatile float adc_rms_voltage = 0.0f;
 uint64_t adc_sq_sum = 0;
 uint16_t adc_sample_cnt = 0;
 #define RMS_SAMPLE_COUNT 100
+
+// ADC State Machine
+typedef enum {
+  ADC_STATE_FEEDBACK = 0, // PA2
+  ADC_STATE_TEMP,         // PA5
+  ADC_STATE_BAT,          // PA6
+  ADC_STATE_CURRENT       // PA7
+} AdcState;
+
+volatile AdcState adc1_state = ADC_STATE_FEEDBACK;
+volatile uint16_t adc_vac_raw = 0;     // ADC2 PA4
+volatile uint16_t adc_temp_raw = 0;    // ADC1 PA5
+volatile uint16_t adc_bat_raw = 0;     // ADC1 PA6
+volatile uint16_t adc_current_raw = 0; // ADC1 PA7
+
+// Filtered Values
+volatile uint16_t adc_temp_flt = 0;
+volatile uint16_t adc_bat_flt = 0;
+volatile uint16_t adc_current_flt = 0;
+volatile float vac_rms_flt = 0.0f;
+
+// Filter Structures
+Filter_t flt_temp = {0};
+Filter_t flt_bat = {0};
+Filter_t flt_current = {0};
+Filter_Float_t flt_vac = {0};
+
+// VAC RMS Calculation Variables
+volatile float vac_rms_voltage = 0.0f;
+float vac_sq_sum = 0.0f;
+uint16_t vac_sample_cnt = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+float Get_Temperature(uint16_t adc_val);
+uint16_t Apply_Filter(Filter_t *f, uint16_t val);
+float Apply_Filter_Float(Filter_Float_t *f, float val);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -114,6 +171,7 @@ int main(void)
   MX_ADC2_Init();
   /* USER CODE BEGIN 2 */
 
+
   OLED_Init();
   // 初始化PI控制器
   // 对应参数: Kp=1.0, Ki=10.0, 输出限幅[0.0, 1.0]
@@ -122,6 +180,9 @@ int main(void)
   // 启动PWM (TIM1)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
 
+  // 启动风扇PWM (TIM2_CH1)
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
   // 校准ADC (提高精度)
   HAL_ADCEx_Calibration_Start(&hadc1);
 
@@ -129,28 +190,37 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    char buf[16];
-    char buf2[16];
-    // HAL_ADC_Start(&hadc2);
-    // if (HAL_ADC_PollForConversion(&hadc2, 100) == HAL_OK)
-    // {
-    //   adc2_value = (float)HAL_ADC_GetValue(&hadc2) * 3.3f / 4096.0f;
-    // }
-    // HAL_ADC_Stop(&hadc2);
+    char buf[20];
 
-    // OLED 中央显示ADC1采样电压（稳压反馈）
-    // (void)snprintf(buf, sizeof(buf), "V=%-5.2fV", voltage_feedback);
-    (void)snprintf(buf, sizeof(buf), "V=%-5.2fV", adc_rms_voltage);
-    OLED_ShowString(32, 1, buf, 16);
-    // OLED_ShowString(32, 3, buf, 16);
+    // 1. 稳压反馈
+    (void)snprintf(buf, sizeof(buf), "V:%-5.2fV", adc_rms_voltage);
+    OLED_ShowString(0, 0, buf, 12);
 
-    HAL_Delay(50); 
+    // 2. 市电电压
+    // float vac_val = (float)adc_vac_raw * 3.3f / 4096.0f; 
+    (void)snprintf(buf, sizeof(buf), "AC:%-4.2fV", vac_rms_flt*404.0f);
+    OLED_ShowString(0, 2, buf, 12);
+
+    // 3. 温度 & 电池 
+    float temp_val = Get_Temperature(adc_temp_flt);
+    float bat_val = ((float)adc_bat_flt * 3.3f / 4096.0f) * 12.0f;
+    (void)snprintf(buf, sizeof(buf), "T:%-3.1f B:%-3.1f", temp_val, bat_val);
+    OLED_ShowString(0, 4, buf, 12);
+
+    // 4. 母线电流 
+    float current_val = (float)adc_current_flt * 3.3f / 4096.0f;
+    (void)snprintf(buf, sizeof(buf), "I:%-4.2fA", current_val);
+    OLED_ShowString(0, 6, buf, 12);
+
+    HAL_Delay(50); // 刷新率 20Hz
 
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -287,6 +357,23 @@ float ADC_ReadVoltage_HAL(void)
 }
 
 /**
+ * @brief  配置ADC1通道
+ * @param  channel: ADC通道
+ * @retval None
+ */
+void ADC1_Select_Channel(uint32_t channel)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+  sConfig.Channel = channel;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_13CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
  * @brief  控制循环
  * @note   读取电压,PI计算,更新PWM占空比,启动下次ADC转换
  * @retval None
@@ -308,7 +395,8 @@ void Control_Loop_HAL(void)
   __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_duty);
 
   // 5. 启动下次ADC转换 (中断方式,非阻塞)
-  HAL_ADC_Start_IT(&hadc1);
+  HAL_ADC_Start_IT(&hadc2); // VAC (ADC2)
+  HAL_ADC_Start_IT(&hadc1); // Feedback (ADC1) - Start Sequence
 }
 
 /**
@@ -341,27 +429,174 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC1)
   {
-    // 读取ADC转换结果并保存
-    adc_value = HAL_ADC_GetValue(&hadc1);
-    adc_ready = 1; // 标记数据已就绪
-
-    // 计算有效值 (RMS)
-    adc_sq_sum += (uint64_t)adc_value * adc_value;
-    adc_sample_cnt++;
-    if (adc_sample_cnt >= RMS_SAMPLE_COUNT)
+    uint16_t val = HAL_ADC_GetValue(&hadc1);
+    
+    switch (adc1_state)
     {
-      float mean_sq = (float)adc_sq_sum / adc_sample_cnt;
-      float rms_adc = sqrtf(mean_sq);
-      // 转换为电压值: (RMS_ADC / 4096) * 3.3 * 5.965
-      adc_rms_voltage = (rms_adc * 3.3f / 4096.0f) * 5.965f;
+      case ADC_STATE_FEEDBACK:
+        // 读取ADC转换结果并保存
+        adc_value = val;
+        adc_ready = 1; // 标记数据已就绪
+
+        // 计算有效值 (RMS)
+        adc_sq_sum += (uint64_t)adc_value * adc_value;
+        adc_sample_cnt++;
+        if (adc_sample_cnt >= RMS_SAMPLE_COUNT)
+        {
+          float mean_sq = (float)adc_sq_sum / adc_sample_cnt;
+          float rms_adc = sqrtf(mean_sq);
+          // 转换为电压值: (RMS_ADC / 4096) * 3.3 * 5.965
+          adc_rms_voltage = (rms_adc * 3.3f / 4096.0f) * 5.965f;
+          
+          adc_sq_sum = 0;
+          adc_sample_cnt = 0;
+        }
+        
+        // Switch to TEMP
+        adc1_state = ADC_STATE_TEMP;
+        ADC1_Select_Channel(ADC_CHANNEL_5);
+        HAL_ADC_Start_IT(&hadc1);
+        break;
+
+      case ADC_STATE_TEMP:
+        adc_temp_raw = val;
+        adc_temp_flt = Apply_Filter(&flt_temp, val);
+        // Switch to BAT
+        adc1_state = ADC_STATE_BAT;
+        ADC1_Select_Channel(ADC_CHANNEL_6);
+        HAL_ADC_Start_IT(&hadc1);
+        break;
+
+      case ADC_STATE_BAT:
+        adc_bat_raw = val;
+        adc_bat_flt = Apply_Filter(&flt_bat, val);
+        // Switch to CURRENT
+        adc1_state = ADC_STATE_CURRENT;
+        ADC1_Select_Channel(ADC_CHANNEL_7);
+        HAL_ADC_Start_IT(&hadc1);
+        break;
+
+      case ADC_STATE_CURRENT:
+        adc_current_raw = val;
+        adc_current_flt = Apply_Filter(&flt_current, val);
+        // Reset to FEEDBACK for next TIM2 trigger
+        adc1_state = ADC_STATE_FEEDBACK;
+        ADC1_Select_Channel(ADC_CHANNEL_2);
+        // STOP sequence, wait for TIM2
+        break;
+    }
+  }
+  else if (hadc->Instance == ADC2)
+  {
+    adc_vac_raw = HAL_ADC_GetValue(&hadc2);
+
+    // 市电电压有效值计算 (RMS)
+    // 1. 转换为电压值 (0-3.3V)
+    float v_in = (float)adc_vac_raw * 3.3f / 4096.0f;
+    // 2. 减去直流偏置 1.5V
+    float v_ac = v_in - 1.5f;
+    // 3. 累加平方和
+    vac_sq_sum += v_ac * v_ac;
+    vac_sample_cnt++;
+
+    if (vac_sample_cnt >= RMS_SAMPLE_COUNT)
+    {
+      // 4. 计算均方根
+      float mean_sq = vac_sq_sum / vac_sample_cnt;
+      vac_rms_voltage = sqrtf(mean_sq);
       
-      adc_sq_sum = 0;
-      adc_sample_cnt = 0;
+      // 对RMS结果进行滤波
+      vac_rms_flt = Apply_Filter_Float(&flt_vac, vac_rms_voltage);
+
+      // 清零重新累计
+      vac_sq_sum = 0.0f;
+      vac_sample_cnt = 0;
     }
   }
 }
 
+/**
+ * @brief  滑动平均滤波 (uint16_t)
+ */
+uint16_t Apply_Filter(Filter_t *f, uint16_t val)
+{
+  f->sum -= f->buffer[f->index];
+  f->buffer[f->index] = val;
+  f->sum += val;
+  
+  f->index++;
+  if (f->index >= FILTER_SIZE)
+  {
+    f->index = 0;
+  }
+
+  if (f->count < FILTER_SIZE)
+  {
+    f->count++;
+  }
+
+  return (uint16_t)(f->sum / f->count);
+}
+
+/**
+ * @brief  滑动平均滤波 (float)
+ */
+float Apply_Filter_Float(Filter_Float_t *f, float val)
+{
+  f->sum -= f->buffer[f->index];
+  f->buffer[f->index] = val;
+  f->sum += val;
+  
+  f->index++;
+  if (f->index >= FILTER_SIZE)
+  {
+    f->index = 0;
+  }
+
+  if (f->count < FILTER_SIZE)
+  {
+    f->count++;
+  }
+
+  return f->sum / f->count;
+}
+
+/**
+ * @brief  计算NTC温度
+ * @param  adc_val: ADC原始值
+ * @retval 温度(摄氏度)
+ */
+float Get_Temperature(uint16_t adc_val)
+{
+    // 1. 先算出引脚的电压 (0-3.3V)
+    float v_pin = (float)adc_val * 3.3f / 4096.0f;
+
+    // 防止除以0的保护
+    if(v_pin >= V_CC || v_pin <= 0.1f) return 0.0f;
+
+    // 2. 反推下半部分的电阻值 (分压公式逆运算)
+    // V_pin = V_cc * (R_down / (R_up + R_down))
+    // 推导得: R_down = (V_pin * R_up) / (V_cc - V_pin)
+    float r_down = (v_pin * R_UP) / (V_CC - v_pin);
+
+    // 3. 算出NTC的实际阻值 (因为有个 R73 5K 跟它并联，要剥离出来)
+    // 1/R_down = 1/R_ntc + 1/R_parallel
+    // 推导得: R_ntc = 1 / ( (1/r_down) - (1/R_parallel) )
+    float r_ntc = 1.0f / ( (1.0f / r_down) - (1.0f / R_PARALLEL) );
+
+    // 如果计算出负值或无穷大，说明没接传感器
+    if (r_ntc <= 0) return 0.0f; 
+
+    // 4. 使用 Steinhart-Hart (Beta) 公式转为温度
+    float log_r = log(r_ntc / R_NTC_25);
+    float temp_kelvin = 1.0f / ( (1.0f / T25) + (log_r / B_VALUE) );
+    float temp_celsius = temp_kelvin - 273.15f; // 转为摄氏度
+
+    return temp_celsius;
+}
+
 /* USER CODE END 4 */
+
 /**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
