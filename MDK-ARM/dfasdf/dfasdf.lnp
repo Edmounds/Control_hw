@@ -6,6 +6,7 @@
 "dfasdf\adc.o"
 "dfasdf\dma.o"
 "dfasdf\tim.o"
+"dfasdf\usart.o"
 "dfasdf\stm32f1xx_it.o"
 "dfasdf\stm32f1xx_hal_msp.o"
 "dfasdf\stm32f1xx_hal_gpio_ex.o"
@@ -23,6 +24,7 @@
 "dfasdf\stm32f1xx_hal_exti.o"
 "dfasdf\stm32f1xx_hal_tim.o"
 "dfasdf\stm32f1xx_hal_tim_ex.o"
+"dfasdf\stm32f1xx_hal_uart.o"
 "dfasdf\system_stm32f1xx.o"
 --strict --scatter "dfasdf\dfasdf.sct"
 --summary_stderr --info summarysizes --map --load_addr_map_info --xref --callgraph --symbols

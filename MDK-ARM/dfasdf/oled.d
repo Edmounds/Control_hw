@@ -30,6 +30,7 @@ dfasdf\oled.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_flash_ex.h
 dfasdf\oled.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_pwr.h
 dfasdf\oled.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_tim.h
 dfasdf\oled.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_tim_ex.h
+dfasdf\oled.o: ../Drivers/STM32F1xx_HAL_Driver/Inc/stm32f1xx_hal_uart.h
 dfasdf\oled.o: ../Core/Inc/oledfont.h
 dfasdf\oled.o: ../Core/Inc/bmp.h
 dfasdf\oled.o: ../Core/Inc/gpio.h

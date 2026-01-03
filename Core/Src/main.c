@@ -21,6 +21,7 @@
 #include "adc.h"
 #include "dma.h"
 #include "tim.h"
+#include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -29,6 +30,7 @@
 #include <stdio.h>
 #include <math.h>
 #include "oled.h"
+#include "usart.h" // CubeMX generated
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,6 +39,18 @@ typedef enum {
   STATE_DARK,
   STATE_BRIGHT
 } LightState;
+
+// Protocol Packet
+typedef struct __attribute__((packed)) {
+  uint8_t head1; // 0xAA
+  uint8_t head2; // 0x55
+  float voltage;
+  float ac_voltage;
+  float temperature;
+  float battery;
+  float current;
+  uint8_t checksum;
+} UART_Packet;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -149,21 +163,7 @@ void Filter_Init(Filter_t *f, uint8_t size);
 void Filter_Float_Init(Filter_Float_t *f, uint8_t size);
 /* USER CODE END PFP */
 
-void Filter_Init(Filter_t *f, uint8_t size) {
-    f->size = (size > MAX_FILTER_SIZE) ? MAX_FILTER_SIZE : size;
-    f->index = 0;
-    f->sum = 0;
-    f->count = 0;
-    for(int i=0; i<MAX_FILTER_SIZE; i++) f->buffer[i] = 0;
-}
-
-void Filter_Float_Init(Filter_Float_t *f, uint8_t size) {
-    f->size = (size > MAX_FILTER_SIZE) ? MAX_FILTER_SIZE : size;
-    f->index = 0;
-    f->sum = 0.0f;
-    f->count = 0;
-    for(int i=0; i<MAX_FILTER_SIZE; i++) f->buffer[i] = 0.0f;
-}/* Private user code ---------------------------------------------------------*/
+/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /* USER CODE END 0 */
@@ -202,6 +202,7 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM2_Init();
   MX_ADC2_Init();
+  MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -242,7 +243,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // --- RMS 计算处理 (移出中断) ---
+    // --- RMS 计算处理  ---
     if (rms_ready_flag & 0x01) // ADC1 Feedback
     {
       float mean_sq = (float)adc_sq_sum_buf / RMS_SAMPLE_COUNT;
@@ -267,7 +268,6 @@ int main(void)
     OLED_ShowString(0, 0, buf, 12);
 
     // 2. 市电电压
-    // float vac_val = (float)adc_vac_raw * 3.3f / 4096.0f; 
     (void)snprintf(buf, sizeof(buf), "AC:%-4.2fV", vac_rms_flt*404.0f);
     OLED_ShowString(0, 2, buf, 12);
 
@@ -286,8 +286,37 @@ int main(void)
     (void)snprintf(buf, sizeof(buf), "I:%-4.2fA", current_actual/11.0f);
     OLED_ShowString(0, 6, buf, 12);
 
-    HAL_Delay(50); // 刷新率 20Hz
+    // --- UART Sending (20Hz) ---
+    UART_Packet pkt;
+    pkt.head1 = 0xAA;
+    pkt.head2 = 0x55;
+    pkt.voltage = adc_rms_voltage;
+    pkt.ac_voltage = vac_rms_flt * 404.0f; // Scale as per display
+    pkt.temperature = temp_val;
+    pkt.battery = bat_val;
+    pkt.current = current_actual / 11.0f;  // Scale as per display
+    
+    // Checksum
+    pkt.checksum = 0;
+    uint8_t *p_chk = (uint8_t*)&pkt.voltage; 
+    for(int i=0; i<20; i++) {
+        pkt.checksum += p_chk[i];
+    }
 
+    extern UART_HandleTypeDef huart3;
+    // Debug: Send Text to verify connection
+    HAL_UART_Transmit(&huart3, (uint8_t*)&pkt, sizeof(pkt), 10);
+    // uint8_t debug_msg[] = "HelloUART\n";
+    // HAL_StatusTypeDef u_status = HAL_UART_Transmit(&huart3, debug_msg, 10, 100);
+    
+    // Debug output to OLED: Show UART Status
+    // HAL_OK=0, HAL_ERROR=1, HAL_BUSY=2, HAL_TIMEOUT=3
+    // char status_buf[10];
+    // snprintf(status_buf, sizeof(status_buf), "U:%d", u_status);
+    // OLED_ShowString(64, 6, status_buf, 12);
+    // ---------------------------
+
+    HAL_Delay(50); // 刷新率 20Hz
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -369,7 +398,7 @@ void PI_Init(PI_Controller *pi, float kp, float ki, float max, float min)
  * @retval PI控制器输出值
  */
 /**
- * @brief  PI控制器更新计算 (已修正积分抗饱和逻辑)
+ * @brief  PI控制器更新计算 
  * @param  pi: PI控制器结构体指针
  * @param  setpoint: 设定值
  * @param  feedback: 反馈值
@@ -478,7 +507,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     // 执行控制循环 (只读取、计算、输出,不阻塞)
     Control_Loop_HAL();
 
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
   }
 }
 
@@ -540,6 +569,26 @@ uint16_t Apply_Filter(Filter_t *f, uint16_t val)
 
 /**
  * @brief  滑动平均滤波 (float)
+ */
+void Filter_Init(Filter_t *f, uint8_t size) {
+    f->size = (size > MAX_FILTER_SIZE) ? MAX_FILTER_SIZE : size;
+    f->index = 0;
+    f->sum = 0;
+    f->count = 0;
+    for(int i=0; i<MAX_FILTER_SIZE; i++) f->buffer[i] = 0;
+}
+
+void Filter_Float_Init(Filter_Float_t *f, uint8_t size) {
+    f->size = (size > MAX_FILTER_SIZE) ? MAX_FILTER_SIZE : size;
+    f->index = 0;
+    f->sum = 0.0f;
+    f->count = 0;
+    for(int i=0; i<MAX_FILTER_SIZE; i++) f->buffer[i] = 0.0f;
+}
+
+/**
+ * @brief  滑动平均滤波 (float)
+ * @note   Add missing functions 
  */
 float Apply_Filter_Float(Filter_Float_t *f, float val)
 {
