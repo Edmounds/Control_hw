@@ -206,7 +206,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
 
-  OLED_Init();
+  // OLED_Init();
   // 初始化PI控制器
   // 对应参数: Kp=1.0, Ki=10.0, 输出限幅[0.0, 1.0]
   PI_Init(&voltage_pi, 1.0f, 12.0f, 1.0f, 0.0f);
@@ -216,6 +216,7 @@ int main(void)
 
   // 启动风扇PWM (TIM2_CH1)
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 500); // 默认满速 (Period=499)
 
   // 校准ADC (提高精度)
   HAL_ADCEx_Calibration_Start(&hadc1);
@@ -225,14 +226,14 @@ int main(void)
 
   // --- 初始化滤波器 ---
   // 温度和电池：用慢速 (64个点 = 32ms窗口)，为了稳！
-  Filter_Init(&flt_temp, FILTER_SIZE_SLOW);
-  Filter_Init(&flt_bat, FILTER_SIZE_SLOW);
+  Filter_Init(&flt_temp, FILTER_SIZE_SLOW + 10);
+  Filter_Init(&flt_bat, FILTER_SIZE_SLOW + 10);
   
   // 电流
   Filter_Init(&flt_current, FILTER_SIZE_SLOW);
   
-  // 市电RMS：它本身更新就慢，稍微平滑一下即可 (比如4)
-  Filter_Float_Init(&flt_vac, 2); 
+
+  Filter_Float_Init(&flt_vac, 4); 
 
   // 启动控制循环定时器 (TIM2)
   HAL_TIM_Base_Start_IT(&htim2);
@@ -261,21 +262,21 @@ int main(void)
     }
     // -----------------------------
 
-    char buf[20];
+    // char buf[20];
 
     // 1. 稳压反馈
-    (void)snprintf(buf, sizeof(buf), "V:%-5.2fV", adc_rms_voltage);
-    OLED_ShowString(0, 0, buf, 12);
+    // (void)snprintf(buf, sizeof(buf), "V:%-5.2fV", adc_rms_voltage);
+    // OLED_ShowString(0, 0, buf, 12);
 
     // 2. 市电电压
-    (void)snprintf(buf, sizeof(buf), "AC:%-4.2fV", vac_rms_flt*404.0f);
-    OLED_ShowString(0, 2, buf, 12);
+    // (void)snprintf(buf, sizeof(buf), "AC:%-4.2fV", vac_rms_flt*404.0f);
+    // OLED_ShowString(0, 2, buf, 12);
 
     // 3. 温度 & 电池 
-    float temp_val = Get_Temperature(adc_temp_flt) - 85.0f;
+    float temp_val = Get_Temperature(adc_temp_flt) - 71.0f;
     float bat_val = ((float)adc_bat_flt * 3.3f / 4096.0f) * 12.0f;
-    (void)snprintf(buf, sizeof(buf), "T:%-3.1f B:%-3.1f", temp_val, bat_val);
-    OLED_ShowString(0, 4, buf, 12);
+    // (void)snprintf(buf, sizeof(buf), "T:%-3.1f B:%-3.1f", temp_val, bat_val);
+    // OLED_ShowString(0, 4, buf, 12);
 
     // 4. 母线电流 
     float v_pin = (float)adc_current_flt * 3.3f / 4096.0f;
@@ -283,18 +284,18 @@ int main(void)
 
     if (current_actual < 0.1f) current_actual = 0.0f; // 强制归零小电流噪音
 
-    (void)snprintf(buf, sizeof(buf), "I:%-4.2fA", current_actual/11.0f);
-    OLED_ShowString(0, 6, buf, 12);
+    // (void)snprintf(buf, sizeof(buf), "I:%-4.2fA", current_actual/11.0f);
+    // OLED_ShowString(0, 6, buf, 12);
 
     // --- UART Sending (20Hz) ---
     UART_Packet pkt;
     pkt.head1 = 0xAA;
     pkt.head2 = 0x55;
     pkt.voltage = adc_rms_voltage;
-    pkt.ac_voltage = vac_rms_flt * 404.0f; // Scale as per display
+    pkt.ac_voltage = vac_rms_flt * 404.0f; 
     pkt.temperature = temp_val;
     pkt.battery = bat_val;
-    pkt.current = current_actual / 11.0f;  // Scale as per display
+    pkt.current = current_actual / 11.0f;  
     
     // Checksum
     pkt.checksum = 0;
@@ -372,15 +373,7 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
-/**
- * @brief  初始化PI控制器
- * @param  pi: PI控制器结构体指针
- * @param  kp: 比例系数
- * @param  ki: 积分系数
- * @param  max: 输出最大值
- * @param  min: 输出最小值
- * @retval None
- */
+
 void PI_Init(PI_Controller *pi, float kp, float ki, float max, float min)
 {
   pi->Kp = kp;
@@ -390,31 +383,16 @@ void PI_Init(PI_Controller *pi, float kp, float ki, float max, float min)
   pi->output_min = min;
 }
 
-/**
- * @brief  PI控制器更新计算
- * @param  pi: PI控制器结构体指针
- * @param  setpoint: 设定值
- * @param  feedback: 反馈值
- * @retval PI控制器输出值
- */
-/**
- * @brief  PI控制器更新计算 
- * @param  pi: PI控制器结构体指针
- * @param  setpoint: 设定值
- * @param  feedback: 反馈值
- * @retval PI控制器输出值
- */
+
 float PI_Update(PI_Controller *pi, float setpoint, float feedback)
 {
   // 1. 计算误差
   float error = setpoint - feedback;
 
   // 2. 计算PI输出
-  // (注意：这里我们先计算总输出，不在这里限幅 integral)
   float output = pi->Kp * error + pi->Ki * pi->integral;
 
   // 3. 总输出限幅
-  // (先计算，再限幅)
   float output_clamped = output;
   if (output_clamped > pi->output_max)
   {
@@ -425,13 +403,7 @@ float PI_Update(PI_Controller *pi, float setpoint, float feedback)
     output_clamped = pi->output_min;
   }
 
-  //
-  // 解释：
-  // (error > 0 && output < pi->output_max) -> 误差为正，且输出没到顶，允许正向累积
-  // (error < 0 && output > pi->output_min) -> 误差为负，且输出没到底，允许反向累积
-  //
-  // 如果 output >= pi->output_max 且 error > 0，积分将停止累加，防止"饱和"
-  //
+
   if ((error > 0.0f && output < pi->output_max) || (error < 0.0f && output > pi->output_min))
   {
     pi->integral += error * 0.0005f;
@@ -442,12 +414,6 @@ float PI_Update(PI_Controller *pi, float setpoint, float feedback)
 }
 
 
-
-/**
- * @brief  控制循环
- * @note   读取电压,PI计算,更新PWM占空比
- * @retval None
- */
 void Control_Loop_HAL(void)
 {
   // 1. 直接从 DMA 数组取值 (Feedback = buffer[0])
@@ -468,7 +434,6 @@ void Control_Loop_HAL(void)
     adc_sq_sum = 0;
     adc_sample_cnt = 0;
   }
-  // ---------------------------
 
   // --- 更新其他传感器滤波值 ---
   // Temp (buffer[1]), Bat (buffer[2]), Current (buffer[3])
@@ -492,12 +457,17 @@ void Control_Loop_HAL(void)
   HAL_ADC_Start_IT(&hadc2); 
 }
 
-/**
- * @brief  定时器周期溢出回调函数
- * @note   当TIM2计数器溢出时,此函数会被调用 (2kHz)
- *         执行闭环控制循环
- * @param  htim: 定时器句柄指针
- * @retval None
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  // 检查是否是TIM2的中断 (控制循环)
+  if (htim->Instance == TIM2)
+  {
+    // 执行控制循环 (只读取、计算、输出,不阻塞)
+    Control_Loop_HAL();
+
+    // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+  }
+}
  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
@@ -511,13 +481,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
 }
 
-/**
- * @brief  ADC转换完成回调函数
- * @note   当ADC转换完成时,此函数会被自动调用
- *         保存ADC结果,供下次控制循环使用
- * @param  hadc: ADC句柄指针
- * @retval None
- */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
   if (hadc->Instance == ADC2)
@@ -544,9 +507,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     }
   }
 }
-/**
- * @brief  滑动平均滤波 (uint16_t)
- */
+
 uint16_t Apply_Filter(Filter_t *f, uint16_t val)
 {
   f->sum -= f->buffer[f->index];
